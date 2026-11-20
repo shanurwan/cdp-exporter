@@ -125,30 +125,59 @@ func TestWatcherCountsEvents(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// An existing target is reported before the reply and must not count.
+	// On the first session, a target that existed before the exporter found
+	// the browser counts as created.
 	send(`{"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"old","type":"page","browserContextId":"C1"}}}`)
 	send(`{"id":1,"result":{}}`)
 	send(`{"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"t1","type":"page","browserContextId":"C2"}}}`)
 	send(`{"method":"Target.targetCrashed","params":{"targetId":"t1","status":"oom","errorCode":-1}}`)
 	send(`{"method":"Target.targetDestroyed","params":{"targetId":"t1"}}`)
 
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		rec.mu.Lock()
-		done := rec.destroyed == 1
-		rec.mu.Unlock()
-		if done || time.Now().After(deadline) {
-			break
+	waitFor := func(what string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			rec.mu.Lock()
+			ok := cond()
+			rec.mu.Unlock()
+			if ok {
+				return
+			}
+			if time.Now().After(deadline) {
+				rec.mu.Lock()
+				defer rec.mu.Unlock()
+				t.Fatalf("%s: created=%d destroyed=%d reconnects=%d crashes=%v", what, rec.created, rec.destroyed, rec.rcount, rec.crashes)
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
+	waitFor("first session", func() bool { return rec.destroyed == 1 })
+	rec.mu.Lock()
+	if rec.created != 2 || rec.rcount != 0 || len(rec.crashes) != 1 || rec.crashes[0] != "page/oom" {
+		t.Errorf("created=%d reconnects=%d crashes=%v, want 2, 0, [page/oom]", rec.created, rec.rcount, rec.crashes)
+	}
+	rec.mu.Unlock()
+	if st := w.State(); !st.Connected || st.Contexts != 1 || st.ByType["page"] != 1 {
+		t.Errorf("state = %+v, want connected with 1 context (C1)", st)
+	}
+
+	// The browser drops the socket and comes back. The reconnect counts once,
+	// and the target it reports again is not created a second time.
+	conn.Close()
+	select {
+	case conn = <-f.conns:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher did not reconnect")
+	}
+	if err := conn.ReadJSON(&req); err != nil {
+		t.Fatal(err)
+	}
+	send(`{"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"old","type":"page","browserContextId":"C1"}}}`)
+	send(`{"id":1,"result":{}}`)
+	waitFor("reconnect", func() bool { return rec.rcount == 1 })
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	if rec.created != 1 || rec.destroyed != 1 || len(rec.crashes) != 1 || rec.crashes[0] != "page/oom" {
-		t.Errorf("created=%d destroyed=%d crashes=%v", rec.created, rec.destroyed, rec.crashes)
-	}
-	st := w.State()
-	if !st.Connected || st.Contexts != 1 || st.ByType["page"] != 1 {
-		t.Errorf("state = %+v, want connected with 1 context (C1)", st)
+	if rec.created != 2 {
+		t.Errorf("created=%d after reconnect, want 2", rec.created)
 	}
 }

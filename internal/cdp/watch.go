@@ -32,6 +32,7 @@ type Watcher struct {
 
 	mu        sync.Mutex
 	connected bool
+	sessions  int // sessions that got as far as the setDiscoverTargets reply
 	targets   map[string]targetInfo
 }
 
@@ -66,12 +67,7 @@ func (w *Watcher) State() State {
 // Run connects and reconnects until ctx is done.
 func (w *Watcher) Run(ctx context.Context) {
 	backoff := 500 * time.Millisecond
-	first := true
 	for ctx.Err() == nil {
-		if !first {
-			w.Events.Reconnect()
-		}
-		first = false
 		started := time.Now()
 		err := w.session(ctx)
 		w.mu.Lock()
@@ -139,8 +135,13 @@ func (w *Watcher) session(ctx context.Context) error {
 	w.mu.Unlock()
 
 	// Chrome reports every existing target as targetCreated before it answers
-	// setDiscoverTargets. Those are not new, so they are not counted.
+	// setDiscoverTargets. On the first session with a browser they are counted
+	// as created: a pool that starts one browser per client creates the first
+	// page before the exporter finds the browser, and leaving those out would
+	// make created and destroyed disagree. After a reconnect they were counted
+	// already.
 	ready := false
+	var existing []string
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
@@ -157,7 +158,17 @@ func (w *Watcher) session(ctx context.Context) error {
 			ready = true
 			w.mu.Lock()
 			w.connected = true
+			first := w.sessions == 0
+			w.sessions++
 			w.mu.Unlock()
+			if first {
+				for _, t := range existing {
+					w.Events.TargetCreated(t)
+				}
+			} else {
+				w.Events.Reconnect()
+			}
+			existing = nil
 			continue
 		}
 		switch m.Method {
@@ -172,8 +183,12 @@ func (w *Watcher) session(ctx context.Context) error {
 			_, known := w.targets[p.TargetInfo.TargetID]
 			w.targets[p.TargetInfo.TargetID] = targetInfo{Type: p.TargetInfo.Type, ContextID: p.TargetInfo.BrowserContextID}
 			w.mu.Unlock()
-			if m.Method == "Target.targetCreated" && ready && !known {
-				w.Events.TargetCreated(p.TargetInfo.Type)
+			if m.Method == "Target.targetCreated" && !known {
+				if ready {
+					w.Events.TargetCreated(p.TargetInfo.Type)
+				} else {
+					existing = append(existing, p.TargetInfo.Type)
+				}
 			}
 		case "Target.targetDestroyed":
 			var p struct {

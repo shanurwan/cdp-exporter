@@ -115,7 +115,7 @@ func New(ctx context.Context, cfg Config) *Collector {
 		crashes: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "target_crashes_total",
 			Help: "Target.targetCrashed events (renderer crashed, was killed or ran out of memory) on watched endpoints."}, []string{"type", "status"}),
 		reconnects: prometheus.NewCounter(prometheus.CounterOpts{Namespace: ns, Name: "cdp_watch_reconnects_total",
-			Help: "Times an event websocket had to reconnect."}),
+			Help: "Times an event websocket was re-established after it dropped while its browser kept running."}),
 		rtt: prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: ns, Name: "cdp_request_duration_seconds",
 			Help:    "Round trip of /json/version probes. A busy or wedged browser answers slowly long before it fails.",
 			Buckets: []float64{.001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5}}),

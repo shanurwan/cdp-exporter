@@ -142,7 +142,7 @@ func run() error {
 		defer cancel()
 		_ = srv.Shutdown(sctx)
 	}()
-	go col.Run(ctx, 5*time.Second)
+	go col.Run(ctx, 2*time.Second)
 	log.Info("listening", "addr", *listen, "version", version, "static_endpoints", static.String(), "discover", *discover)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
