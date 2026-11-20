@@ -18,12 +18,13 @@ import (
 	"time"
 )
 
-// DefaultGlobs are the temporary profile directories created by Puppeteer and
-// Playwright, and the per-launch scratch directories Chrome itself creates.
+// DefaultGlobs are the temporary profile directories created by Puppeteer,
+// Playwright and browserless.
 var DefaultGlobs = []string{
 	"/tmp/puppeteer_dev_chrome_profile-*",
 	"/tmp/puppeteer_dev_profile-*",
 	"/tmp/playwright_chromiumdev_profile-*",
+	"/tmp/browserless-data-dirs/browserless-data-dir-*",
 }
 
 // LockState describes a directory's SingletonLock.
