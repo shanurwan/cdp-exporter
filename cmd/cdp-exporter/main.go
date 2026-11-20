@@ -56,6 +56,7 @@ func run() error {
 		lockHost     = flag.String("lock-hostname", "", "hostname Chrome writes into SingletonLock (default: this host's name)")
 		maxBrowsers  = flag.Int("ready-max-browsers", 0, "report not ready when this many browsers run (0 = no limit)")
 		maxMemory    = flag.Int64("ready-max-browser-memory-bytes", 0, "report not ready when the largest browser uses more than this (0 = no limit)")
+		maxTotal     = flag.Int64("ready-max-memory-bytes", 0, "report not ready when all Chrome processes together use more than this (0 = no limit)")
 		logLevel     = flag.String("log-level", "info", "debug, info, warn or error")
 		showVersion  = flag.Bool("version", false, "print the version and exit")
 		static       multiFlag
@@ -115,13 +116,14 @@ func run() error {
 
 	readyScan := procscan.New(*procRoot)
 	readyScan.NamePattern = re
-	readyScan.ReadPSS = *pss && *maxMemory > 0
+	readyScan.ReadPSS = *pss && (*maxMemory > 0 || *maxTotal > 0)
+	limits := readyLimits{browsers: *maxBrowsers, browserMem: *maxMemory, totalMem: *maxTotal}
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn)}))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprintln(w, "ok") })
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		if reason := notReady(r.Context(), client, static, readyScan, *maxBrowsers, *maxMemory); reason != "" {
+		if reason := notReady(r.Context(), client, static, readyScan, limits); reason != "" {
 			http.Error(w, reason, http.StatusServiceUnavailable)
 			return
 		}
@@ -150,11 +152,16 @@ func run() error {
 	return nil
 }
 
+type readyLimits struct {
+	browsers             int
+	browserMem, totalMem int64
+}
+
 // notReady returns why the browser container should not take new sessions, or
 // "" when it may. Every static endpoint must answer, and the optional capacity
 // limits must not be reached. A Kubernetes Service then stops routing new
 // connections to a full pod without killing the sessions it already holds.
-func notReady(ctx context.Context, c *cdp.Client, static []string, ps *procscan.Scanner, maxBrowsers int, maxMem int64) string {
+func notReady(ctx context.Context, c *cdp.Client, static []string, ps *procscan.Scanner, lim readyLimits) string {
 	for _, ep := range static {
 		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		_, _, err := c.Version(cctx, ep)
@@ -163,35 +170,49 @@ func notReady(ctx context.Context, c *cdp.Client, static []string, ps *procscan.
 			return fmt.Sprintf("cdp endpoint %s: %v", ep, err)
 		}
 	}
-	if maxBrowsers <= 0 && maxMem <= 0 {
+	if lim.browsers <= 0 && lim.browserMem <= 0 && lim.totalMem <= 0 {
 		return ""
 	}
 	snap, err := ps.Scan()
 	if err != nil {
 		return "proc scan: " + err.Error()
 	}
-	if maxBrowsers > 0 && len(snap.Browsers) >= maxBrowsers {
-		return fmt.Sprintf("at capacity: %d browsers (limit %d)", len(snap.Browsers), maxBrowsers)
+	if lim.browsers > 0 && len(snap.Browsers) >= lim.browsers {
+		return fmt.Sprintf("at capacity: %d browsers (limit %d)", len(snap.Browsers), lim.browsers)
 	}
-	if maxMem > 0 {
+	if lim.totalMem > 0 {
+		var total int64
+		for _, p := range snap.Procs {
+			if p.Chrome && p.State != 'Z' {
+				total += memOf(p)
+			}
+		}
+		if total > lim.totalMem {
+			return fmt.Sprintf("chrome uses %d bytes (limit %d)", total, lim.totalMem)
+		}
+	}
+	if lim.browserMem > 0 {
 		for _, b := range snap.Browsers {
 			var mem int64
 			for _, p := range snap.Tree(b.PID) {
-				if !p.Chrome || p.State == 'Z' {
-					continue
-				}
-				if p.HasPSS {
-					mem += int64(p.PSS)
-				} else {
-					mem += int64(p.RSS)
+				if p.Chrome && p.State != 'Z' {
+					mem += memOf(p)
 				}
 			}
-			if mem > maxMem {
-				return fmt.Sprintf("browser pid %d uses %d bytes (limit %d)", b.PID, mem, maxMem)
+			if mem > lim.browserMem {
+				return fmt.Sprintf("browser pid %d uses %d bytes (limit %d)", b.PID, mem, lim.browserMem)
 			}
 		}
 	}
 	return ""
+}
+
+// memOf is PSS where it was readable, RSS otherwise.
+func memOf(p *procscan.Proc) int64 {
+	if p.HasPSS {
+		return int64(p.PSS)
+	}
+	return int64(p.RSS)
 }
 
 func buildInfo() prometheus.Collector {
