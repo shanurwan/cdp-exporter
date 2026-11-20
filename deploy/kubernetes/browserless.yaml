@@ -1,0 +1,101 @@
+# browserless with cdp-exporter as a sidecar.
+#
+# - shareProcessNamespace lets the exporter see Chrome's processes. It also
+#   makes the pause container PID 1, which reaps zombies, so
+#   chrome_defunct_processes stays at 0 here even when a browser is killed.
+# - Both containers mount the same /tmp, where browserless keeps one profile
+#   directory per session. SingletonLock holds the pod's hostname, which the
+#   containers share, so lock states need no flag.
+# - The exporter runs as browserless's UID and GID (999). The kernel shows a
+#   process's smaps_rollup (PSS) only to the same UID and GID.
+# - The exporter's readiness probe fails when the pod holds --ready-max-browsers
+#   browsers, so the Service sends new sessions to another replica instead of
+#   queueing them here. Sessions already open keep their connections.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: browserless
+  labels: {app: browserless}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: browserless}
+  template:
+    metadata:
+      labels: {app: browserless}
+    spec:
+      shareProcessNamespace: true
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: browserless
+          image: ghcr.io/browserless/chromium:v2.63.1
+          env:
+            - {name: CONCURRENT, value: "4"}
+            - {name: QUEUED, value: "4"}
+            - {name: TIMEOUT, value: "300000"}
+          ports:
+            - {name: http, containerPort: 3000}
+          readinessProbe:
+            httpGet: {path: /json/version, port: http}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 500m, memory: 1Gi}
+            limits: {memory: 3Gi}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+            - {name: shm, mountPath: /dev/shm}
+        - name: cdp-exporter
+          image: ghcr.io/shanurwan/cdp-exporter:v0.1.0
+          args:
+            - --ready-max-browsers=4
+          ports:
+            - {name: metrics, containerPort: 9431}
+          readinessProbe:
+            httpGet: {path: /readyz, port: metrics}
+            periodSeconds: 2
+            failureThreshold: 1
+          livenessProbe:
+            httpGet: {path: /healthz, port: metrics}
+            periodSeconds: 20
+          securityContext:
+            runAsUser: 999
+            runAsGroup: 999
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp, readOnly: true}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 1Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: browserless
+spec:
+  selector: {app: browserless}
+  ports:
+    - {name: http, port: 3000, targetPort: http}
+---
+# Scrape target for Prometheus. With the Prometheus Operator, use a PodMonitor
+# on port "metrics" instead.
+apiVersion: v1
+kind: Service
+metadata:
+  name: browserless-metrics
+  labels: {app: browserless}
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9431"
+spec:
+  selector: {app: browserless}
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - {name: metrics, port: 9431, targetPort: metrics}
