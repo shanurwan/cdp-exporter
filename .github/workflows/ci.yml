@@ -17,6 +17,12 @@ jobs:
       - run: go vet ./...
       - run: go test -race -count=1 ./...
       - run: CGO_ENABLED=0 go build ./cmd/cdp-exporter
+      - name: alert rules
+        run: |
+          docker run --rm -v "$PWD/deploy/prometheus":/r -w /r --entrypoint promtool prom/prometheus:v3.7.3 check rules alerts.yml
+          docker run --rm -v "$PWD/deploy/prometheus":/r -w /r --entrypoint promtool prom/prometheus:v3.7.3 test rules alerts_test.yml
+      - name: dashboard is valid JSON
+        run: python3 -m json.tool deploy/grafana/cdp-exporter.json >/dev/null
   e2e:
     runs-on: ubuntu-latest
     needs: test

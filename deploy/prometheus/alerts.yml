@@ -1,0 +1,116 @@
+# Alerting rules for cdp-exporter. Tested with:
+#   promtool test rules deploy/prometheus/alerts_test.yml
+# Thresholds marked "tune" depend on the workload; the rest should hold
+# for any browser pool.
+groups:
+  - name: cdp-exporter
+    rules:
+      - alert: ChromeZombieProcesses
+        expr: sum by (instance, parent) (chrome_defunct_processes) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} Chrome zombies under {{ $labels.parent }} on {{ $labels.instance }}"
+          description: >-
+            Exited Chrome processes are not being reaped because their parent
+            ({{ $labels.parent }}) is PID 1 or has stopped waiting on children.
+            Each one holds a PID; when the pids limit is reached, Chrome cannot
+            start renderers. Run the container with an init (docker run --init,
+            tini, dumb-init) or share the pod's process namespace.
+
+      - alert: ChromeOrphanProcesses
+        expr: sum by (instance) (chrome_orphan_processes) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} orphaned Chrome processes on {{ $labels.instance }}"
+          description: >-
+            Renderer, zygote or utility processes outlived their browser and
+            still hold memory (chrome_orphan_resident_memory_bytes). Chrome
+            does not clean them up; kill the browser's process group when it
+            dies, or restart the container.
+
+      - alert: ChromeProfileDirsLeaking
+        expr: chrome_profile_dirs{state="leaked"} > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} leaked Chrome profile directories on {{ $labels.instance }}"
+          description: >-
+            Temporary user-data directories that no running browser uses are
+            left on disk (usually after a browser was killed). They fill /tmp,
+            often a memory-backed emptyDir, until the pod is evicted.
+
+      - alert: ChromeStaleSingletonLock
+        expr: chrome_profile_locks{state="stale"} > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stale SingletonLock in {{ $value }} Chrome profiles on {{ $labels.instance }}"
+          description: >-
+            A SingletonLock names a PID that is not a running browser. A Chrome
+            started on the same user-data directory will refuse to start
+            ("The profile appears to be in use"). Common after an OOM kill.
+
+      - alert: ChromeTabCrashes
+        # tune: crashes a pool can absorb depends on its traffic.
+        expr: sum by (instance) (increase(chrome_target_crashes_total[10m])) > 5
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | humanize }} tab crashes in 10 minutes on {{ $labels.instance }}"
+          description: >-
+            Target.targetCrashed events by status are in chrome_target_crashes_total.
+            status="oom" points at the renderer memory limit; "killed" at the
+            kernel or the cgroup OOM killer.
+
+      - alert: ChromeBrowserNeverExits
+        # tune: set above the pool's longest legitimate session.
+        expr: chrome_browser_oldest_age_seconds > 3600
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "A Chrome browser on {{ $labels.instance }} has run for {{ $value | humanizeDuration }}"
+          description: >-
+            Session pools close browsers after a timeout. A browser older than
+            the longest session is usually a leaked one that still holds memory
+            and a concurrency slot.
+
+      - alert: ChromeCDPEndpointDown
+        expr: chrome_cdp_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "CDP endpoint {{ $labels.endpoint }} on {{ $labels.instance }} does not answer"
+          description: >-
+            /json/version failed for 2 minutes. The browser is gone or wedged;
+            clients connecting now will fail.
+
+      - alert: ChromeCDPSlow
+        expr: >-
+          histogram_quantile(0.9, sum by (instance, le) (rate(chrome_cdp_request_duration_seconds_bucket[5m]))) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p90 CDP round trip {{ $value | humanizeDuration }} on {{ $labels.instance }}"
+          description: >-
+            The browser's DevTools handler is slow to answer /json/version,
+            which usually means its main thread or the host CPU is saturated.
+
+      - alert: CdpExporterProcScanFailing
+        expr: chrome_exporter_proc_up == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cdp-exporter on {{ $labels.instance }} cannot scan /proc"
+          description: >-
+            All /proc-based Chrome metrics are missing. Check --proc-root and
+            that the exporter shares the browser's PID namespace.

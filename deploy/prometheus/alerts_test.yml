@@ -1,0 +1,169 @@
+# promtool test rules deploy/prometheus/alerts_test.yml
+rule_files:
+  - alerts.yml
+evaluation_interval: 1m
+tests:
+  # A browser killed under a Node PID 1: zombies appear and stay. The alert
+  # waits 5 minutes, so a zombie reaped quickly never pages.
+  - interval: 1m
+    input_series:
+      - series: 'chrome_defunct_processes{instance="pod-a",comm="chrome",parent="node"}'
+        values: "0 7x10"
+      - series: 'chrome_defunct_processes{instance="pod-a",comm="chrome_crashpad",parent="node"}'
+        values: "0 2x10"
+      - series: 'chrome_defunct_processes{instance="pod-b",comm="chrome",parent="tini"}'
+        values: "0 1 0x9"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: ChromeZombieProcesses
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: ChromeZombieProcesses
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: pod-a, parent: node}
+            exp_annotations:
+              summary: "9 Chrome zombies under node on pod-a"
+              description: >-
+                Exited Chrome processes are not being reaped because their parent
+                (node) is PID 1 or has stopped waiting on children.
+                Each one holds a PID; when the pids limit is reached, Chrome cannot
+                start renderers. Run the container with an init (docker run --init,
+                tini, dumb-init) or share the pod's process namespace.
+
+  - interval: 1m
+    input_series:
+      - series: 'chrome_orphan_processes{instance="pod-a",type="renderer"}'
+        values: "3x20"
+      - series: 'chrome_orphan_processes{instance="pod-a",type="zygote"}'
+        values: "1x20"
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: ChromeOrphanProcesses
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: ChromeOrphanProcesses
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: pod-a}
+            exp_annotations:
+              summary: "4 orphaned Chrome processes on pod-a"
+              description: >-
+                Renderer, zygote or utility processes outlived their browser and
+                still hold memory (chrome_orphan_resident_memory_bytes). Chrome
+                does not clean them up; kill the browser's process group when it
+                dies, or restart the container.
+
+  # A profile that is leaked for a few minutes and then removed by the pool's
+  # own cleanup does not fire; one that stays does.
+  - interval: 1m
+    input_series:
+      - series: 'chrome_profile_dirs{instance="pod-a",state="leaked"}'
+        values: "1x5 0x5 2x20"
+      - series: 'chrome_profile_locks{instance="pod-a",state="stale"}'
+        values: "0 1x10"
+      - series: 'chrome_profile_locks{instance="pod-a",state="live"}'
+        values: "8x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ChromeProfileDirsLeaking
+        exp_alerts: []
+      - eval_time: 28m
+        alertname: ChromeProfileDirsLeaking
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: pod-a, state: leaked}
+            exp_annotations:
+              summary: "2 leaked Chrome profile directories on pod-a"
+              description: >-
+                Temporary user-data directories that no running browser uses are
+                left on disk (usually after a browser was killed). They fill /tmp,
+                often a memory-backed emptyDir, until the pod is evicted.
+      - eval_time: 7m
+        alertname: ChromeStaleSingletonLock
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: pod-a, state: stale}
+            exp_annotations:
+              summary: "Stale SingletonLock in 1 Chrome profiles on pod-a"
+              description: >-
+                A SingletonLock names a PID that is not a running browser. A Chrome
+                started on the same user-data directory will refuse to start
+                ("The profile appears to be in use"). Common after an OOM kill.
+
+  # Crashes are summed across type and status: 4 oom + 3 killed in 10 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'chrome_target_crashes_total{instance="pod-a",type="page",status="oom"}'
+        values: "0+0.4x20"
+      - series: 'chrome_target_crashes_total{instance="pod-a",type="page",status="killed"}'
+        values: "0+0.3x20"
+      - series: 'chrome_target_crashes_total{instance="pod-b",type="page",status="crashed"}'
+        values: "0+0.1x20"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ChromeTabCrashes
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: pod-a}
+            exp_annotations:
+              summary: "7 tab crashes in 10 minutes on pod-a"
+              description: >-
+                Target.targetCrashed events by status are in chrome_target_crashes_total.
+                status="oom" points at the renderer memory limit; "killed" at the
+                kernel or the cgroup OOM killer.
+
+  - interval: 1m
+    input_series:
+      - series: 'chrome_browser_oldest_age_seconds{instance="pod-a"}'
+        values: "3300+60x15"
+      - series: 'chrome_cdp_up{instance="pod-a",endpoint="http://127.0.0.1:9222"}'
+        values: "1 1 0 0 0 0 1"
+      - series: 'chrome_exporter_proc_up{instance="pod-a"}'
+        values: "1x10"
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: ChromeBrowserNeverExits
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: ChromeBrowserNeverExits
+        exp_alerts:
+          - exp_labels: {severity: info, instance: pod-a}
+            exp_annotations:
+              summary: "A Chrome browser on pod-a has run for 1h 6m 0s"
+              description: >-
+                Session pools close browsers after a timeout. A browser older than
+                the longest session is usually a leaked one that still holds memory
+                and a concurrency slot.
+      - eval_time: 3m
+        alertname: ChromeCDPEndpointDown
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: ChromeCDPEndpointDown
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: pod-a, endpoint: "http://127.0.0.1:9222"}
+            exp_annotations:
+              summary: "CDP endpoint http://127.0.0.1:9222 on pod-a does not answer"
+              description: >-
+                /json/version failed for 2 minutes. The browser is gone or wedged;
+                clients connecting now will fail.
+      - eval_time: 10m
+        alertname: CdpExporterProcScanFailing
+        exp_alerts: []
+
+  # Every /json/version call takes about a second for 15 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'chrome_cdp_request_duration_seconds_bucket{instance="pod-a",le="0.5"}'
+        values: "0x20"
+      - series: 'chrome_cdp_request_duration_seconds_bucket{instance="pod-a",le="1"}'
+        values: "0x20"
+      - series: 'chrome_cdp_request_duration_seconds_bucket{instance="pod-a",le="2.5"}'
+        values: "0+12x20"
+      - series: 'chrome_cdp_request_duration_seconds_bucket{instance="pod-a",le="+Inf"}'
+        values: "0+12x20"
+    alert_rule_test:
+      - eval_time: 18m
+        alertname: ChromeCDPSlow
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: pod-a}
+            exp_annotations:
+              summary: "p90 CDP round trip 2.35s on pod-a"
+              description: >-
+                The browser's DevTools handler is slow to answer /json/version,
+                which usually means its main thread or the host CPU is saturated.
